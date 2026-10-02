@@ -54,11 +54,23 @@ class Editor:
         root.bind('<Control-o>', lambda e: self.open())
         root.bind('<Control-s>', lambda e: self.save())
         self.rows = {}
+        self.cell_editor = None
+        self.tree.bind('<Button-1>', lambda e: self.finish_edit(), add='+')
+        self.tree.bind('<Configure>', lambda e: self.finish_edit(), add='+')
+        self.tree.bind('<MouseWheel>', lambda e: self.finish_edit(), add='+')
+        self.tree.bind('<<TreeviewClose>>', lambda e: self.finish_edit(), add='+')
+        self.tree.configure(yscrollcommand=lambda *args: self.scrolled(scroll, *args),
+                            xscrollcommand=lambda *args: self.scrolled(horizontal, *args))
+
+    def scrolled(self, scrollbar, *args):
+        self.finish_edit()
+        scrollbar.set(*args)
 
     def discard(self):
         return not self.document or not self.document.changed or messagebox.askyesno('Несохранённые изменения', 'Продолжить и отменить несохранённые изменения?', parent=self.root)
 
     def open(self):
+        self.finish_edit()
         if not self.discard():
             return
         path = filedialog.askopenfilename(filetypes=[('XML', '*.xml'), ('Все файлы', '*.*')])
@@ -76,6 +88,7 @@ class Editor:
             messagebox.showwarning('Пропущенные записи', f'Неоднозначных или неподдерживаемых записей: {document.skipped}. Они сохраняются без изменений.')
 
     def render(self):
+        self.finish_edit()
         self.tree.delete(*self.tree.get_children())
         self.rows = {}
         if not self.document:
@@ -109,51 +122,86 @@ class Editor:
 
     def update_status(self):
         doc = self.document
-        self.status.config(text=f'{len(doc.records)} параметров • изменено: {doc.changed} • пропущено: {doc.skipped}   |   Двойной щелчок или Enter — редактировать')
+        self.status.config(text=f'{len(doc.records)} параметров • изменено: {doc.changed} • пропущено: {doc.skipped}   |   Двойной щелчок — ввод • Enter — применить • Esc — отменить • Tab — далее')
         self.save_button.config(state='normal' if doc.records else 'disabled')
         self.reset_button.config(state='normal' if doc.changed else 'disabled')
 
     def edit(self, event=None):
-        iid = self.tree.identify_row(event.y) if event and event.keysym != 'Return' else self.tree.focus()
+        keyboard = event is None or event.keysym == 'Return'
+        iid = self.tree.focus() if keyboard else self.tree.identify_row(event.y)
         if iid not in self.rows:
             return
+        column = ('#1' if self.rows[iid].fields['Value'] is not None else '#2') if keyboard else self.tree.identify_column(event.x)
+        if column in ('#1', '#2'):
+            self.start_edit(iid, column)
+            return 'break'
+
+    def start_edit(self, iid, column):
+        self.finish_edit()
+        key = {'#1': 'Value', '#2': 'DisplayValue'}[column]
         row = self.rows[iid]
-        dialog = tk.Toplevel(self.root)
-        dialog.title(row.destination.getAttribute('Name'))
-        dialog.transient(self.root)
-        dialog.resizable(True, False)
-        variables, entries = {}, {}
-        for index, key in enumerate(('Value', 'DisplayValue')):
-            ttk.Label(dialog, text=key).grid(row=index, column=0, padx=12, pady=12)
-            variables[key] = tk.StringVar(value=text(row.fields[key]))
-            entries[key] = ttk.Entry(dialog, textvariable=variables[key], width=55, state='normal' if row.fields[key] is not None else 'disabled')
-            entries[key].grid(row=index, column=1, padx=12, pady=12, sticky='ew')
-        def synchronize(*args):
-            if self.sync.get() and row.fields['DisplayValue'] is not None:
-                variables['DisplayValue'].set(variables['Value'].get())
-        variables['Value'].trace_add('write', synchronize)
-        def apply():
-            for key in variables:
-                row.edit(key, variables[key].get(), sync=False)
-            self.refresh(iid)
-            self.update_status()
-            dialog.destroy()
-        buttons = ttk.Frame(dialog)
-        buttons.grid(row=2, column=0, columnspan=2, pady=10)
-        ttk.Button(buttons, text='Применить', command=apply).pack(side='left', padx=6)
-        ttk.Button(buttons, text='Отмена', command=dialog.destroy).pack(side='left', padx=6)
-        dialog.columnconfigure(1, weight=1)
-        dialog.bind('<Return>', lambda e: apply())
-        dialog.bind('<Escape>', lambda e: dialog.destroy())
-        dialog.grab_set()
-        entries['Value' if row.fields['Value'] is not None else 'DisplayValue'].focus_set()
+        if row.fields[key] is None:
+            return
+        self.tree.see(iid)
+        self.tree.update_idletasks()
+        box = self.tree.bbox(iid, column)
+        if not box:
+            return
+        self.tree.selection_set(iid)
+        self.tree.focus(iid)
+        entry = ttk.Entry(self.tree)
+        entry.insert(0, text(row.fields[key]))
+        entry.place(x=box[0], y=box[1], width=box[2], height=box[3])
+        self.cell_editor = (entry, iid, key, column)
+        entry.bind('<Return>', lambda e: self.finish_edit(focus_tree=True))
+        entry.bind('<Escape>', lambda e: self.finish_edit(commit=False, focus_tree=True))
+        entry.bind('<Tab>', lambda e: self.next_cell(1))
+        entry.bind('<Shift-Tab>', lambda e: self.next_cell(-1))
+        entry.bind('<ISO_Left_Tab>', lambda e: self.next_cell(-1))
+        entry.bind('<FocusOut>', lambda e: self.finish_edit())
+        entry.focus_set()
+        entry.selection_range(0, 'end')
+
+    def finish_edit(self, commit=True, focus_tree=False):
+        active = getattr(self, 'cell_editor', None)
+        if active is None:
+            return 'break'
+        self.cell_editor = None
+        entry, iid, key, column = active
+        value = entry.get()
+        entry.destroy()
+        if commit and iid in self.rows:
+            row = self.rows[iid]
+            # Merely visiting Value must not overwrite a formatted DisplayValue.
+            if value != text(row.fields[key]):
+                row.edit(key, value, sync=self.sync.get())
+                self.refresh(iid)
+                self.update_status()
+        if focus_tree:
+            self.tree.focus_set()
+        return 'break'
+
+    def next_cell(self, direction):
+        if self.cell_editor is None:
+            return 'break'
+        _, iid, _, column = self.cell_editor
+        cells = [(rid, col) for rid, row in self.rows.items()
+                 for col, key in (('#1', 'Value'), ('#2', 'DisplayValue'))
+                 if row.fields[key] is not None]
+        index = cells.index((iid, column)) + direction
+        self.finish_edit(focus_tree=True)
+        if 0 <= index < len(cells):
+            self.start_edit(*cells[index])
+        return 'break'
 
     def reset(self):
+        self.finish_edit()
         if self.document and messagebox.askyesno('Отменить изменения', 'Восстановить значения на момент открытия или последнего сохранения?'):
             self.document.reset()
             self.render()
 
     def save(self):
+        self.finish_edit()
         if not self.document or not self.document.records:
             return
         path = filedialog.asksaveasfilename(defaultextension='.xml', initialfile=self.path.stem + '_edited.xml', filetypes=[('XML', '*.xml')])
@@ -182,6 +230,7 @@ class Editor:
                 os.unlink(temporary)
 
     def close(self):
+        self.finish_edit()
         if self.discard():
             self.root.destroy()
 
