@@ -1,0 +1,39 @@
+name: Build Windows EXE
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          architecture: x64
+          cache: pip
+      - name: Install build dependencies
+        run: python -m pip install -r requirements-build.txt
+      - name: Test XML handling
+        run: python -m unittest discover -s tests -v
+      - name: Build standalone windowed executable
+        run: python -m PyInstaller --noconfirm --clean --onefile --windowed --noupx --name Monaco_XML_Editor Monaco_XML_Editor.pyw
+      - name: Check executable starts with Tk
+        shell: pwsh
+        run: |
+          $process = Start-Process -FilePath dist/Monaco_XML_Editor.exe -ArgumentList '--smoke-test' -PassThru
+          if (-not $process.WaitForExit(30000)) { $process.Kill(); throw 'GUI smoke test timed out' }
+          if ($process.ExitCode -ne 0) { throw "GUI smoke test failed: $($process.ExitCode)" }
+          Get-FileHash dist/Monaco_XML_Editor.exe -Algorithm SHA256 | Format-List | Out-File dist/SHA256.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Monaco_XML_Editor-Windows-x64
+          path: |
+            dist/Monaco_XML_Editor.exe
+            dist/SHA256.txt
+          if-no-files-found: error
+          retention-days: 90
